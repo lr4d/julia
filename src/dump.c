@@ -313,16 +313,33 @@ static void jl_serialize_datatype(jl_serializer_state *s, jl_datatype_t *dt) JL_
         tag = 10;
     }
 
-    if (strncmp(jl_symbol_name(dt->name->name), "#kw#", 4) == 0) {
-        /* XXX: yuck, but the auto-generated kw types from the serializer isn't a real type, so we *must* be very careful */
-        assert(tag == 0 || tag == 5 || tag == 6 || tag == 10);
-        if (tag == 6) {
+    if (strncmp(jl_symbol_name(dt->name->name), "#kw#", 4) == 0 && !internal && tag != 0) {
+        /* XXX: yuck, this is horrible, but the auto-generated kw types from the serializer isn't a real type, so we *must* be very careful */
+        assert(tag == 6); // other struct types should never exist
+        tag = 9;
+        if (jl_type_type_mt->kwsorter != NULL && dt == (jl_datatype_t*)jl_typeof(jl_type_type_mt->kwsorter)) {
+            dt = jl_datatype_type; // any representative member with this MethodTable
+        }
+        else if (jl_nonfunction_mt->kwsorter != NULL && dt == (jl_datatype_t*)jl_typeof(jl_nonfunction_mt->kwsorter)) {
+            dt = jl_symbol_type; // any representative member with this MethodTable
+        }
+        else {
+            // search for the representative member of this MethodTable
             jl_methtable_t *mt = dt->name->mt;
-            jl_datatype_t *primarydt = (jl_datatype_t*)jl_unwrap_unionall(jl_get_global(mt->module, mt->name));
+            size_t l = strlen(jl_symbol_name(mt->name));
+            char *prefixed;
+            prefixed = (char*)malloc(l + 2);
+            prefixed[0] = '#';
+            strcpy(&prefixed[1], jl_symbol_name(mt->name));
+            jl_sym_t *tname = jl_symbol(prefixed);
+            free(prefixed);
+            jl_value_t *primarydt = jl_get_global(mt->module, tname);
+            if (!primarydt)
+                primarydt = jl_get_global(mt->module, mt->name);
+            primarydt = jl_unwrap_unionall(primarydt);
             assert(jl_is_datatype(primarydt));
-            assert(jl_typeof(primarydt->name->mt->kwsorter) == (jl_value_t*)dt);
-            dt = primarydt;
-            tag = 9;
+            assert(primarydt == (jl_value_t*)jl_any_type || jl_typeof(((jl_datatype_t*)primarydt)->name->mt->kwsorter) == (jl_value_t*)dt);
+            dt = (jl_datatype_t*)primarydt;
         }
     }
 
@@ -781,9 +798,9 @@ static void jl_serialize_value_(jl_serializer_state *s, jl_value_t *v, int as_li
         write_uint8(s->s, internal);
         if (!internal)
             return;
-        jl_datatype_t *gf = jl_first_argument_datatype((jl_value_t*)m->sig);
-        assert(jl_is_datatype(gf) && gf->name->mt);
-        external_mt = !module_in_worklist(gf->name->mt->module);
+        jl_methtable_t *mt = jl_method_table_for((jl_value_t*)m->sig);
+        assert((jl_value_t*)mt != jl_nothing);
+        external_mt = !module_in_worklist(mt->module);
         jl_serialize_value(s, m->specializations);
         jl_serialize_value(s, (jl_value_t*)m->name);
         jl_serialize_value(s, (jl_value_t*)m->file);
@@ -1111,9 +1128,9 @@ static int jl_collect_methcache_from_mod(jl_typemap_entry_t *ml, void *closure) 
     return 1;
 }
 
-static void jl_collect_methtable_from_mod(jl_array_t *s, jl_typename_t *tn) JL_GC_DISABLED
+static void jl_collect_methtable_from_mod(jl_array_t *s, jl_methtable_t *mt) JL_GC_DISABLED
 {
-    jl_typemap_visitor(tn->mt->defs, jl_collect_methcache_from_mod, (void*)s);
+    jl_typemap_visitor(mt->defs, jl_collect_methcache_from_mod, (void*)s);
 }
 
 static void jl_collect_lambdas_from_mod(jl_array_t *s, jl_module_t *m) JL_GC_DISABLED
@@ -1133,8 +1150,8 @@ static void jl_collect_lambdas_from_mod(jl_array_t *s, jl_module_t *m) JL_GC_DIS
                         jl_methtable_t *mt = tn->mt;
                         if (mt != NULL &&
                                 (jl_value_t*)mt != jl_nothing &&
-                                (mt != jl_type_type_mt || tn == jl_type_typename)) {
-                            jl_collect_methtable_from_mod(s, tn);
+                                (mt != jl_type_type_mt && mt != jl_nonfunction_mt)) {
+                            jl_collect_methtable_from_mod(s, mt);
                             jl_collect_missing_backedges_to_mod(mt);
                         }
                     }
@@ -2171,9 +2188,9 @@ static void jl_insert_methods(jl_array_t *list)
         jl_method_t *meth = (jl_method_t*)jl_array_ptr_ref(list, i);
         jl_tupletype_t *simpletype = (jl_tupletype_t*)jl_array_ptr_ref(list, i + 1);
         assert(jl_is_method(meth));
-        jl_datatype_t *gf = jl_first_argument_datatype((jl_value_t*)meth->sig);
-        assert(jl_is_datatype(gf) && gf->name->mt);
-        jl_method_table_insert(gf->name->mt, meth, simpletype);
+        jl_methtable_t *mt = jl_method_table_for((jl_value_t*)meth->sig);
+        assert((jl_value_t*)mt != jl_nothing);
+        jl_method_table_insert(mt, meth, simpletype);
     }
 }
 
@@ -2240,9 +2257,8 @@ static void jl_insert_backedges(jl_array_t *list, arraylist_t *dependent_worlds)
                     jl_method_instance_add_backedge((jl_method_instance_t*)callee, caller);
                 }
                 else {
-                    jl_datatype_t *ftype = jl_first_argument_datatype(callee);
-                    jl_methtable_t *mt = ftype->name->mt;
-                    assert(jl_is_datatype(ftype) && mt);
+                    jl_methtable_t *mt = jl_method_table_for(callee);
+                    assert((jl_value_t*)mt != jl_nothing);
                     jl_method_table_add_backedge(mt, callee, (jl_value_t*)caller);
                 }
             }
@@ -2767,6 +2783,10 @@ JL_DLLEXPORT int jl_save_incremental(const char *fname, jl_array_t *worklist)
         assert(jl_is_module(m));
         jl_collect_lambdas_from_mod(lambdas, m);
     }
+    jl_collect_methtable_from_mod(lambdas, jl_type_type_mt);
+    jl_collect_missing_backedges_to_mod(jl_type_type_mt);
+    jl_collect_methtable_from_mod(lambdas, jl_nonfunction_mt);
+    jl_collect_missing_backedges_to_mod(jl_nonfunction_mt);
 
     jl_collect_backedges(edges);
 
@@ -3041,8 +3061,8 @@ static jl_method_t *jl_lookup_method_worldset(jl_methtable_t *mt, jl_datatype_t 
 static jl_method_t *jl_recache_method(jl_method_t *m, size_t start, arraylist_t *dependent_worlds)
 {
     jl_datatype_t *sig = (jl_datatype_t*)m->sig;
-    jl_datatype_t *ftype = jl_first_argument_datatype((jl_value_t*)sig);
-    jl_methtable_t *mt = ftype->name->mt;
+    jl_methtable_t *mt = jl_method_table_for((jl_value_t*)m->sig);
+    assert((jl_value_t*)mt != jl_nothing);
     jl_set_typeof(m, (void*)(intptr_t)0x30); // invalidate the old value to help catch errors
     jl_method_t *_new = jl_lookup_method_worldset(mt, sig, dependent_worlds);
     jl_update_backref_list((jl_value_t*)m, (jl_value_t*)_new, start);
@@ -3053,8 +3073,8 @@ static jl_method_instance_t *jl_recache_method_instance(jl_method_instance_t *mi
 {
     jl_datatype_t *sig = (jl_datatype_t*)mi->def.value;
     assert(jl_is_datatype(sig) || jl_is_unionall(sig));
-    jl_datatype_t *ftype = jl_first_argument_datatype((jl_value_t*)sig);
-    jl_methtable_t *mt = ftype->name->mt;
+    jl_methtable_t *mt = jl_method_table_for((jl_value_t*)sig);
+    assert((jl_value_t*)mt != jl_nothing);
     jl_method_t *m = jl_lookup_method_worldset(mt, sig, dependent_worlds);
     jl_datatype_t *argtypes = (jl_datatype_t*)mi->specTypes;
     jl_set_typeof(mi, (void*)(intptr_t)0x40); // invalidate the old value to help catch errors
